@@ -5,6 +5,8 @@ const sendEmail = require('../utils/nodemailer');
 const newDate = require('../utils/newDate');
 // sha256 단방향 해시 비밀번호 사용
 const crypto = require('crypto');
+// aes128(front) 비밀번호 복호화
+const decryptPassword = require('../utils/decryptPassword');
 
 class UserService {
     /* create 완료 */
@@ -44,8 +46,13 @@ class UserService {
         // 이메일 인증이 되었고 회원가입을 진행하므로 더 이상 쓸모가 없으므로 제거
         await Verify.deleteMany(verify);
 
+        // password 를 백엔드에 보내 줄 때 aes-128 양방향 암호화 적용
+        // 백엔드에서는 aes-128 을 복호화하고 sha-256 해시화하여 db sha-256 해시 값과 비교시킨다.
+        const key = process.env.AES_KEY;
+        const decryptedPassword = decryptPassword(bodyData.password, key);
+
         // sha256 단방향 해시 비밀번호 사용
-        const hash = crypto.createHash('sha256').update(bodyData.password).digest('hex');
+        const hash = crypto.createHash('sha256').update(decryptedPassword).digest('hex');
         const newUser = await User.create({
             email: bodyData.email,
             name: bodyData.name,
@@ -64,7 +71,7 @@ class UserService {
         const user = await User.findOne({name, phone});
         if(!user){
             const error = new Error();
-            Object.assign(error, {data: [], code: 404, message: "이름과 전화번호로 조회된 회원이 없습니다."})
+            Object.assign(error, {code: 404, message: "이름과 전화번호로 조회된 회원이 없습니다."})
             throw error;
         }
         return {data: user.email, code: 200, message: "유저 ID가 성공적으로 조회되었습니다. ID를 확인해주세요!"};
@@ -150,65 +157,73 @@ class UserService {
         let verify;
         // 회원가입에서 인증 코드 요청했었는지, 비밀번호 찾기에서 인증 코드 요청했었는지 판단 변수
         let myCode;
-        if(secret.length === 6){
+
+        if(secret.length !== 6 && secret.length !== 8){
+            const error = new Error();
+            Object.assign(error, {code: 400, message: "인증 코드의 길이를 확인해주세요."});
+            throw error;
+        }
+        else if(secret.length === 6){
             myCode = code.VERIFYCODE;
             verify = await Verify.findOne({data: email, code: code.VERIFYCODE});
             if(!verify){
                 const error = new Error();
-                Object.assign(error, {code: 400, message: "회원가입 인증 코드를 요청하지 않은 이메일 입니다."});
+                Object.assign(error, {code: 400, message: "인증 코드 길이 확인이 필요하거나, 인증 요청하지 않은 이메일 입니다."});
                 throw error;
+            } else {
+                // 인증 코드 비교 진행( 정상 인증 코드로 판단 시 is_verified 를 true 로 변경하여 회원가입 절차가 가능하도록 함)
+                if(secret === verify.secret){
+                    await Verify.updateOne({data: email, code: code.VERIFYCODE},{
+                        is_verified: true
+                    });
+                    return {code: 200, message: "이메일 인증 코드가 정상적으로 확인되었습니다."}   
+                } else {
+                    await Verify.updateOne({data: email, code: code.VERIFYCODE},{
+                        is_verified: false
+                    });
+                    const error = new Error();
+                    Object.assign(error, {code: 400, message: "이메일 인증 코드를 다시 확인해주세요."});
+                    throw error;
+                }
             }
-        } // 8 자리는 비밀번호 찾기 인증 코드 요청 길이
+        } 
+
+        // 8 자리는 비밀번호 찾기 인증 코드 요청 길이
         else if(secret.length === 8){
             myCode = code.PASSWORD;
             verify = await Verify.findOne({data: email, code: code.PASSWORD});
             if(!verify){
                 const error = new Error();
-                Object.assign(error, {code: 400, message: "비밀번호 찾기 인증 코드를 요청하지 않은 이메일 입니다."});
+                Object.assign(error, {code: 400, message: "인증 코드 길이 확인이 필요하거나, 인증 요청하지 않은 이메일 입니다."});
                 throw error;
+            } else {
+                if(secret === verify.secret){
+                    // 비밀번호 찾기는 비밀번호 찾기 요청 버튼을 눌렀을 때 인증 데이터 삭제하여야 함
+                    await Verify.deleteMany({data: email, code: code.PASSWORD});
+                    return {code: 200, message: "이메일 인증 코드가 정상적으로 확인되었습니다."}
+                } else {
+                    await Verify.updateOne({data: email, code: code.PASSWORD},{
+                        is_verified: false
+                    });
+                    const error = new Error();
+                    Object.assign(error, {code: 400, message: "이메일 인증 코드를 다시 확인해주세요."});
+                    throw error;
+                }
             }
-        }
-        
-        // 인증 코드 비교 진행( 정상 인증 코드로 판단 시 is_verified 를 true 로 변경하여 회원가입 절차가 가능하도록 함)
-        if(secret === verify.secret){
-            // 회원 가입에서 요청했었을 때
-            if(myCode === code.VERIFYCODE){
-                await Verify.updateOne({data: email, code: code.VERIFYCODE},{
-                    is_verified: true
-                });
-                // 회원 가입은 인증 요청 누르고 일단 체크만 하고, 회원 등록 버튼을 눌렀을 때 인증 데이터 삭제됨
-            } // 비밀번호 찾기에서 요청했었을 때
-            else if(myCode === code.PASSWORD){
-                // 비밀번호 찾기는 비밀번호 찾기 요청 버튼을 눌렀을 때 인증 데이터 삭제하여야 함
-                await Verify.deleteMany({data: email, code: code.PASSWORD});
-            }
-            return {code: 200, message: "이메일 인증 코드가 정상적으로 확인되었습니다."}
-        } else {
-            if(myCode === code.VERIFYCODE){
-                await Verify.updateOne({data: email, code: code.VERIFYCODE},{
-                    is_verified: false
-                });
-            } else if(myCode === code.PASSWORD){
-                await Verify.updateOne({data: email, code: code.PASSWORD},{
-                    is_verified: false
-                });
-            }
-            const error = new Error();
-            Object.assign(error, {code: 400, message: "이메일 인증 코드를 다시 확인해주세요."});
-            throw error;
         }
     }
 
     // 전체 유저 조회(관리자)
     async findAllUser(){
         // 원하는 속성들만 찾기
-        const users = await User.find({}, 'email name nickname phone nanoid create_at update_at');
+        // 실제 서비스에서는 유저가 매우 많을 때(1000명 이상 등) 을 고려하여 페이지네이션이 있으면 좋음 (피드백 사항)
+        const users = await User.find({}, 'email name nickname phone photo nanoid is_admin create_at update_at');
         return users;
     }
 
     // findOne by email
     async findByEmail({email}) {
-        const user = await User.findOne({email}, 'email name nickname phone nanoid create_at update_at');
+        const user = await User.findOne({email}, 'email name nickname phone photo nanoid is_admin create_at update_at');
         if(!user){
             const error = new Error();
             Object.assign(error, {data: [], code: 404, message: "이메일로 조회된 회원이 없습니다."})
@@ -219,11 +234,22 @@ class UserService {
 
     // update by email (nickname, password, phone 수정 가능)
     async updateByEmail({email}, bodyData){
+        // 수정일 경우 닉네임, 전화번호 중복 검사가 이뤄지는데 
+        // 부분 수정이 가능해야 하므로 => 기존 user 와 동일한 사용자와 중복일 경우는 pass 처리해야함
+        // 기존 유저 정보
+        const user = await User.findOne({email});
+        if(!user){
+            const error = new Error();
+            Object.assign(error, {code: 404, message: "이메일로 조회된 회원이 없습니다."})
+            throw error;
+        }
+
         // 닉네임 중복 체크 후 업데이트
         if(bodyData.nickname){
             const {nickname} = bodyData;
             const nameUser = await User.findOne({nickname: nickname});
-            if(nameUser){
+            // 수정한 닉네임을 이미 사용하는 다른 사용자가 있을 경우 중복처리
+            if(nameUser && (nameUser.email !== user.email)){
                 const error = new Error();
                 Object.assign(error, {code: 400, message: "중복된 닉네임입니다. 닉네임을 변경해주세요."});
                 throw error;
@@ -233,37 +259,40 @@ class UserService {
         if(bodyData.phone){
             const {phone} = bodyData;
             const phoneUser = await User.findOne({phone});
-            if(phoneUser){
+            // 수정한 전화번호를 이미 사용하는 다른 사용자가 있을 경우 중복처리
+            if(phoneUser && (phoneUser.email !== user.email)){
                 const error = new Error();
                 Object.assign(error, {code: 400, message: "중복된 전화번호입니다. 전화번호를 변경해주세요."});
                 throw error;
             };
         }
-        
-        const user = await User.findOne({email});
-        if(!user){
-            const error = new Error();
-            Object.assign(error, {code: 404, message: "이메일로 조회된 회원이 없습니다."})
-            throw error;
-        } else {
+
+        // 비밀 번호 수정사항이 있을 경우, sha256 단방향 해시 비밀번호 사용
+        // 10자리 패스워드 프론트와 맞춤(특수문자 포함은 front 에서 체크 후 넘어옴)
+        // crypto 의 경우 비밀번호 보다는 덜 중요한 정보에 많이 쓰이고, Bcrypt 가 더 비밀번호로는 많이 쓰임(피드백 추천 사항)
+        if(bodyData.password && bodyData.password.length >= 10){
+            // password 를 백엔드에 보내 줄 때 aes-128 양방향 암호화 적용
+            // 백엔드에서는 aes-128 을 복호화하고 sha-256 해시화하여 db sha-256 해시 값과 비교시킨다.
+            const key = process.env.AES_KEY;
+            const decryptedPassword = decryptPassword(bodyData.password, key);
+
             // sha256 단방향 해시 비밀번호 사용
-            if(bodyData.password){
-                // sha256 단방향 해시 비밀번호 사용
-                const hash = crypto.createHash('sha256').update(bodyData.password).digest('hex');
-                bodyData.password = hash
-            }
-            // update 날짜 부여
-            bodyData.update_at = newDate();
-
-            // 수정할 수 없는 정보들은 프로퍼티 제거
-            Reflect.deleteProperty(bodyData, "email");
-            Reflect.deleteProperty(bodyData, "nanoid");
-            Reflect.deleteProperty(bodyData, "is_admin");
-            Reflect.deleteProperty(bodyData, "name");
-
-            await User.updateOne(user, bodyData);
-            return {code: 200, message: `${email} 사용자 수정 동작 완료`};
+            const hash = crypto.createHash('sha256').update(decryptedPassword).digest('hex');
+            bodyData.password = hash
+        } else {
+            Reflect.deleteProperty(bodyData, "password");
         }
+        // update 날짜 부여
+        bodyData.update_at = newDate();
+
+        // 수정할 수 없는 정보들은 프로퍼티 제거
+        Reflect.deleteProperty(bodyData, "email");
+        Reflect.deleteProperty(bodyData, "nanoid");
+        Reflect.deleteProperty(bodyData, "is_admin");
+        Reflect.deleteProperty(bodyData, "name");
+
+        await User.updateOne(user, bodyData);
+        return {code: 200, message: `${email} 사용자 수정 동작 완료`};
     }
 
     // delete by email
@@ -272,7 +301,7 @@ class UserService {
         const user = await User.findOne({email});
         if(!user){
             const error = new Error();
-            Object.assign(error, {code: 404, message: "이메일로 조회된 회원이 없습니다."})
+            Object.assign(error, {code: 404, message: "탈퇴한 회원 또는 이메일로 조회된 회원이 없습니다."})
             throw error;
         } else {
             await Post.deleteMany({author: user});
